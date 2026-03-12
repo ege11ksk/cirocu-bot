@@ -31,11 +31,15 @@ TZ = pytz.timezone("Europe/Istanbul")
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 DEFAULT_DB: dict = {
+    "users": {},
+    "active_users_today": [],
+    "last_reset_date": datetime.date.today().isoformat(),
+}
+
+DEFAULT_USER: dict = {
     "total_turnover": 0.0,
     "daily_income": 0.0,
     "daily_expense": 0.0,
-    "active_users_today": [],
-    "last_reset_date": datetime.date.today().isoformat(),
 }
 
 
@@ -43,12 +47,22 @@ def load_db() -> dict:
     try:
         with open(DB_FILE, "r") as f:
             data = json.load(f)
-        for key, val in DEFAULT_DB.items():
-            if key not in data:
-                data[key] = val
+        # Migration: if old flat format, discard and start fresh per-user
+        if "users" not in data:
+            logger.info("Migrating old DB to per-user format.")
+            data = DEFAULT_DB.copy()
+            data["users"] = {}
+        if "active_users_today" not in data:
+            data["active_users_today"] = []
+        if "last_reset_date" not in data:
+            data["last_reset_date"] = datetime.date.today().isoformat()
         return data
     except (FileNotFoundError, json.JSONDecodeError):
-        return DEFAULT_DB.copy()
+        return {
+            "users": {},
+            "active_users_today": [],
+            "last_reset_date": datetime.date.today().isoformat(),
+        }
 
 
 def save_db(data: dict) -> None:
@@ -57,6 +71,18 @@ def save_db(data: dict) -> None:
         os.makedirs(db_dir, exist_ok=True)
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def get_user_data(user_id: int) -> dict:
+    """Return (and init if needed) per-user stats dict."""
+    uid = str(user_id)
+    if uid not in db["users"]:
+        db["users"][uid] = DEFAULT_USER.copy()
+    u = db["users"][uid]
+    for k, v in DEFAULT_USER.items():
+        if k not in u:
+            u[k] = v
+    return u
 
 
 db: dict = load_db()
@@ -95,8 +121,6 @@ def convert_amount(amount: float, from_c: str, to_c: str, rates: dict) -> float 
     if from_c == to_c:
         return amount
 
-    COINGECKO = {"usdt": "tether", "trx": "tron"}
-
     def to_usd(c: str, v: float) -> float | None:
         if c == "usdt":
             return v * rates["tether"]["usd"]
@@ -124,13 +148,11 @@ def convert_amount(amount: float, from_c: str, to_c: str, rates: dict) -> float 
             return usd / rates["tether"]["usd"] * rates["tether"]["try"]
         return None
 
-    # Try direct TRY paths first (most common)
     if to_c == "try":
         return to_try(from_c, amount)
     if from_c == "try":
         usd = to_usd("try", amount)
         return from_usd(usd, to_c) if usd is not None else None
-    # Cross-currency via USD
     usd = to_usd(from_c, amount)
     return from_usd(usd, to_c) if usd is not None else None
 
@@ -153,26 +175,17 @@ def fmt_amount(n: float, currency: str) -> str:
     c = currency.upper()
     if c == "TRY":
         return f"{fmt_try(n)} TRY"
-    # Trim trailing zeros for crypto
     s = f"{n:.6f}".rstrip("0").rstrip(".")
     return f"{s} {c}"
 
 
 # ── Trigger regex ─────────────────────────────────────────────────────────────
-#
-# Handles:
-#   180 usdt to try
-#   90-30 usdt to try
-#   5000 try                   ← TRY direct (no conversion)
-#   5000+1000-500 try
-#   150 usdt %30 to try        ← percentage first, then convert
-#   trx to usdt triggers etc.
-#
+
 TRIGGER = re.compile(
-    r"(\d+(?:[+\-]\d+)*)"           # group 1 – math expression
-    r"\s+(usdt|try|trx)"             # group 2 – from currency
-    r"(?:\s+%(\d+(?:\.\d+)?))?"     # group 3 – optional %N
-    r"(?:\s+to\s+(usdt|try|trx))?", # group 4 – optional "to CURRENCY"
+    r"(\d+(?:[+\-]\d+)*)"
+    r"\s+(usdt|try|trx)"
+    r"(?:\s+%(\d+(?:\.\d+)?))?"
+    r"(?:\s+to\s+(usdt|try|trx))?",
     re.IGNORECASE,
 )
 
@@ -184,7 +197,7 @@ def safe_eval(expr: str) -> float | None:
     if not re.fullmatch(r"\d+([+\-]\d+)*", clean):
         return None
     try:
-        return float(eval(clean))  # noqa: S307 – safe: only digits and +/-
+        return float(eval(clean))  # noqa: S307
     except Exception:
         return None
 
@@ -203,43 +216,47 @@ def make_keyboard(msg_id: int) -> InlineKeyboardMarkup:
 # ── Reports ───────────────────────────────────────────────────────────────────
 
 def send_instant_report(user_id: int) -> None:
-    """DM the user the current total turnover (called after every transaction)."""
+    """DM the user their own current total turnover."""
     with data_lock:
-        turnover = db["total_turnover"]
+        u = get_user_data(user_id)
+        turnover = u["total_turnover"]
     msg = (
         "📊 Güncel Durum Özeti\n\n"
-        f"💰 Toplam Kârımız: <b>{fmt_try(turnover)} TL</b>\n\n"
+        f"💰 Toplam Kârın: <b>{fmt_try(turnover)} TL</b>\n\n"
         "güzel satış kanka devam et 🤓"
     )
     bot.send_message(user_id, msg, parse_mode="HTML")
 
 
 def send_daily_report() -> None:
-    """Send end-of-day report to all active users at 23:59."""
+    """Send personal end-of-day report to each active user at 23:59."""
     with data_lock:
-        daily_income  = db["daily_income"]
-        daily_expense = db["daily_expense"]
-        users         = list(db["active_users_today"])
+        users = list(db["active_users_today"])
 
     now = datetime.datetime.now(TZ)
     date_str = now.strftime("%d.%m.%Y")
-    net = daily_income - daily_expense
-
-    net_line = ""
-    if net > 0:
-        net_line = f"\n\n🟢 Net Kâr: ₺{fmt_try(net)}"
-    elif net < 0:
-        net_line = f"\n\n🔴 Net Zarar: ₺{fmt_try(abs(net))}"
-
-    report = (
-        f"📊 Gün Sonu Kar Raporu Taslağı\n\n"
-        f"📅 Tarih: {date_str}\n\n"
-        f"💰 Toplam Gelir: ₺{fmt_try(daily_income)}\n\n"
-        f"💸 Toplam Gider: ₺{fmt_try(daily_expense)}\n\n"
-        f"⚖️ Net Sonuç:{net_line}"
-    )
 
     for uid in users:
+        with data_lock:
+            u = get_user_data(int(uid))
+            daily_income  = u["daily_income"]
+            daily_expense = u["daily_expense"]
+
+        net = daily_income - daily_expense
+        net_line = ""
+        if net > 0:
+            net_line = f"\n\n🟢 Net Kâr: ₺{fmt_try(net)}"
+        elif net < 0:
+            net_line = f"\n\n🔴 Net Zarar: ₺{fmt_try(abs(net))}"
+
+        report = (
+            f"📊 Gün Sonu Kar Raporu Taslağı\n\n"
+            f"📅 Tarih: {date_str}\n\n"
+            f"💰 Toplam Gelirin: ₺{fmt_try(daily_income)}\n\n"
+            f"💸 Toplam Giderin: ₺{fmt_try(daily_expense)}\n\n"
+            f"⚖️ Net Sonuç:{net_line}"
+        )
+
         try:
             bot.send_message(uid, report)
         except Exception as exc:
@@ -249,15 +266,16 @@ def send_daily_report() -> None:
 
 
 def reset_daily_stats() -> None:
-    """Reset daily stats at 00:00 (1 min after report)."""
+    """Reset each user's daily stats at 00:00 (1 min after report)."""
     with data_lock:
         now = datetime.datetime.now(TZ)
-        db["daily_income"] = 0.0
-        db["daily_expense"] = 0.0
+        for uid in db["users"]:
+            db["users"][uid]["daily_income"] = 0.0
+            db["users"][uid]["daily_expense"] = 0.0
         db["active_users_today"] = []
         db["last_reset_date"] = now.date().isoformat()
         save_db(db)
-    logger.info("Daily stats reset at 00:00.")
+    logger.info("Daily stats reset at 00:00 for all users.")
 
 
 # ── Transaction processor ─────────────────────────────────────────────────────
@@ -266,8 +284,9 @@ def _maybe_reset_daily() -> None:
     """Reset daily stats if the date has changed (call while holding data_lock)."""
     today = datetime.datetime.now(TZ).date().isoformat()
     if db.get("last_reset_date") != today:
-        db["daily_income"] = 0.0
-        db["daily_expense"] = 0.0
+        for uid in db["users"]:
+            db["users"][uid]["daily_income"] = 0.0
+            db["users"][uid]["daily_expense"] = 0.0
         db["active_users_today"] = []
         db["last_reset_date"] = today
 
@@ -281,20 +300,21 @@ def process_transaction(
 ) -> None:
     with data_lock:
         _maybe_reset_daily()
+        u = get_user_data(user_id)
 
         if specific_minus is not None:
             actual = try_amount - specific_minus
-            db["total_turnover"] += actual
+            u["total_turnover"] += actual
             if actual >= 0:
-                db["daily_income"] += actual
+                u["daily_income"] += actual
             else:
-                db["daily_expense"] += abs(actual)
+                u["daily_expense"] += abs(actual)
         elif add:
-            db["total_turnover"] += try_amount
-            db["daily_income"]   += try_amount
+            u["total_turnover"] += try_amount
+            u["daily_income"]   += try_amount
         else:
-            db["total_turnover"] -= try_amount
-            db["daily_expense"]  += try_amount
+            u["total_turnover"] -= try_amount
+            u["daily_expense"]  += try_amount
 
         if user_id not in db["active_users_today"]:
             db["active_users_today"].append(user_id)
@@ -360,6 +380,7 @@ def handle_message(message: telebot.types.Message) -> None:
     if (
         message.reply_to_message
         and message.reply_to_message.from_user
+        and bot_me
         and message.reply_to_message.from_user.id == bot_me.id
     ):
         orig_id = message.reply_to_message.message_id
@@ -394,16 +415,13 @@ def handle_message(message: telebot.types.Message) -> None:
     if math_result is None:
         return
 
-    # Apply percentage if present
     if pct_str is not None:
         math_result = math_result * float(pct_str) / 100.0
 
-    # ── Case 1: "5000 try" — TRY amount directly (no conversion) ─────────────
     if from_curr == "try" and not to_curr:
         try_amount = math_result
         reply_text = fmt_amount(try_amount, "try")
 
-    # ── Case 2: bidirectional conversion ─────────────────────────────────────
     elif to_curr and from_curr != to_curr:
         rates = get_rates()
         if rates is None:
@@ -416,7 +434,6 @@ def handle_message(message: telebot.types.Message) -> None:
 
         reply_text = f"{fmt_amount(math_result, from_curr)} = {fmt_amount(converted, to_curr)}"
 
-        # Track TRY equivalent for the turnover buttons
         if to_curr == "try":
             try_amount = converted
         elif from_curr == "try":
@@ -424,7 +441,6 @@ def handle_message(message: telebot.types.Message) -> None:
         else:
             try_amount = to_try_equivalent(math_result, from_curr, rates)
 
-    # ── Case 3: percentage-only with no "to" (e.g. "150 usdt %30") ───────────
     elif pct_str is not None and not to_curr:
         rates = get_rates()
         try_amount = to_try_equivalent(math_result, from_curr, rates) if rates else math_result
@@ -433,7 +449,6 @@ def handle_message(message: telebot.types.Message) -> None:
     else:
         return
 
-    # Send reply with placeholder keyboard, then update with real message_id
     sent = bot.reply_to(message, reply_text, reply_markup=make_keyboard(0))
     pending_transactions[sent.message_id] = try_amount
     bot.edit_message_reply_markup(
@@ -482,7 +497,7 @@ def run_flask() -> None:
     flask_app.run(host="0.0.0.0", port=9000, use_reloader=False)
 
 
-# ── Scheduler (23:59 Istanbul) ────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
     scheduler = BackgroundScheduler(timezone=TZ)
