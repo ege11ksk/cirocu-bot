@@ -215,7 +215,7 @@ def send_instant_report(user_id: int) -> None:
 
 
 def send_daily_report() -> None:
-    """Send end-of-day report to all active users, then reset daily stats."""
+    """Send end-of-day report to all active users at 23:59."""
     with data_lock:
         daily_income  = db["daily_income"]
         daily_expense = db["daily_expense"]
@@ -245,14 +245,19 @@ def send_daily_report() -> None:
         except Exception as exc:
             logger.warning("Could not send daily report to %s: %s", uid, exc)
 
+    logger.info("Daily report sent to %d users.", len(users))
+
+
+def reset_daily_stats() -> None:
+    """Reset daily stats at 00:00 (1 min after report)."""
     with data_lock:
+        now = datetime.datetime.now(TZ)
         db["daily_income"] = 0.0
         db["daily_expense"] = 0.0
         db["active_users_today"] = []
         db["last_reset_date"] = now.date().isoformat()
         save_db(db)
-
-    logger.info("Daily report sent to %d users and stats reset.", len(users))
+    logger.info("Daily stats reset at 00:00.")
 
 
 # ── Transaction processor ─────────────────────────────────────────────────────
@@ -482,8 +487,9 @@ def run_flask() -> None:
 def start_scheduler() -> None:
     scheduler = BackgroundScheduler(timezone=TZ)
     scheduler.add_job(send_daily_report, "cron", hour=23, minute=59)
+    scheduler.add_job(reset_daily_stats, "cron", hour=0, minute=0)
     scheduler.start()
-    logger.info("Scheduler started — daily report at 23:59 Istanbul time.")
+    logger.info("Scheduler started — report at 23:59, reset at 00:00 Istanbul time.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
