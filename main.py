@@ -22,9 +22,9 @@ if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
 
 bot = telebot.TeleBot(TOKEN)
-bot_me = bot.get_me()
+bot_me = None  # initialized in main()
 
-DB_FILE = "bot/database.json"
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.json")
 data_lock = threading.Lock()
 TZ = pytz.timezone("Europe/Istanbul")
 
@@ -52,7 +52,9 @@ def load_db() -> dict:
 
 
 def save_db(data: dict) -> None:
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    db_dir = os.path.dirname(DB_FILE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -487,6 +489,8 @@ def start_scheduler() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    bot_me = bot.get_me()
+    logger.info(f"Logged in as @{bot_me.username}")
     threading.Thread(target=run_flask, daemon=True).start()
     start_scheduler()
     logger.info("Bot is starting with polling…")
